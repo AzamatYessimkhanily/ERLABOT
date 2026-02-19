@@ -82,7 +82,13 @@ def find_user_sheet_id(user_id):
 def create_user_sheet(user_id, username, first_name):
     log.info(f"🆕 Создаём таблицу для {first_name} (@{username})...")
     title = f"FUNDAMENTA — {first_name} (@{username or user_id})"
-    new_sh = gc.create(title)
+    try:
+        new_sh = gc.create(title)
+    except Exception as e:
+        if "quota" in str(e).lower() or "storage" in str(e).lower():
+            log.error(f"❌ Google Drive переполнен! {e}")
+            return None
+        raise e
     sheet_id = new_sh.id
     new_sh.share('', perm_type='anyone', role='reader')
 
@@ -112,6 +118,9 @@ def get_user_ws(user_id, username="", first_name=""):
     sheet_id = find_user_sheet_id(user_id)
     if not sheet_id:
         sheet_id = create_user_sheet(user_id, username, first_name)
+    if not sheet_id:
+        log.error(f"❌ Не удалось создать таблицу для {user_id}")
+        return None
     try:
         sh = gc.open_by_key(sheet_id)
         data = {
@@ -518,7 +527,12 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     await del_msg(st)
 
     if not uw:
-        return await msg.answer("❌ Ошибка подключения к таблице.\nПопробуй позже или напиши в поддержку.")
+        return await msg.answer(
+            "❌ *Ошибка создания таблицы!*\n\n"
+            "Скорее всего переполнен Google Drive.\n"
+            "Напиши администратору для решения.",
+            parse_mode="Markdown"
+        )
 
     cfg = get_config(uw)
 
