@@ -1,8 +1,9 @@
 import logging
 import sys
 import re
+import asyncio
 import gspread
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -18,17 +19,26 @@ MASTER_SHEET_ID = '1DCUghK3I2108lyMbpM_1n_XTDw9HxhhaBhmAmOt9rXo'
 CREDENTIALS_FILE = 'sheetsapi-443912-7487420df9cd.json'
 YOUTUBE_LESSON_URL = "https://youtube.com/"
 
+# ── ВИДЕО-КРУГЛЯШИ ──
+# ВАЖНО: VIDEO_2 и VIDEO_3 были перепутаны, сейчас стоят правильно!
 VIDEO_1_INTRO = "DQACAgIAAxkBAAICCmmUgJ-9aD1_vuMco8tXcv9AC0RpAAJ4jQACTpWoSF_997AbFDQaOgQ"
-VIDEO_2_SEBES = "DQACAgIAAxkBAAICDGmUgJ_G4WYKwxkKYvtXuD1sohMKAAKHjQACTpWoSJoKnlDD7qDtOgQ"
-VIDEO_3_OPER  = "DQACAgIAAxkBAAICC2mUgJ-IPpL8vGPfC6Giib0e1U7ZAAKDjQACTpWoSLnsjGLdJkKcOgQ"
-VIDEO_4_DOP   = "DQACAgIAAxkBAAICDWmUgJ8ybwsukX88otT2SVMs5GR-AAKNjQACTpWoSGlethuhDPdpOgQ"
+VIDEO_2_SEBES = "DQACAgIAAxkBAAICC2mUgJ-IPpL8vGPfC6Giib0e1U7ZAAKDjQACTpWoSLnsjGLdJkKcOgQ"   # Объясняет себестоимость
+VIDEO_3_OPER  = "DQACAgIAAxkBAAICDGmUgJ_G4WYKwxkKYvtXuD1sohMKAAKHjQACTpWoSJoKnlDD7qDtOgQ"   # Объясняет операционные
+VIDEO_4_DOP   = "DQACAgIAAxkBAAICDWmUgJ8ybwsukX88otT2SVMs5GR-AAKNjQACTpWoSGlethuhDPdpOgQ"   # Объясняет дополнительные
 
-FUND_VIDEOS = {1: VIDEO_2_SEBES, 2: VIDEO_3_OPER, 3: VIDEO_4_DOP}
-# Круг 1 (VIDEO_1_INTRO) отправляется в /start
-# Круг 2 (VIDEO_2_SEBES) объясняет себестоимость → с Шагом 1
-# Круг 3 (VIDEO_3_OPER) объясняет операционные → с Шагом 2
-# Круг 4 (VIDEO_4_DOP) объясняет дополнительные → с Шагом 3
-# После финала — без видео, только результат + YouTube
+# 👇 Замени на file_id нового круга когда запишешь!
+VIDEO_5_FINAL = "DQACAgIAAxkBAAIDZGme68d3kUWD1GKs0GQZ3wdsIXJgAAINkQAC1C3gSMgAASWCVcRy6joE"
+
+# Какой круг на каком шаге:
+# Шаг 1 (себестоимость) → VIDEO_1_INTRO (интро + объясняет себестоимость)
+# Шаг 2 (операционные)  → VIDEO_2_SEBES (объясняет операционные)
+# Шаг 3 (дополнительные) → VIDEO_3_OPER (объясняет дополнительные)
+# После завершения → VIDEO_4_DOP (завершающий круг)
+# Вместе с распределением → VIDEO_5_FINAL (тестовая неделя)
+FUND_VIDEOS = {1: VIDEO_1_INTRO, 2: VIDEO_2_SEBES, 3: VIDEO_3_OPER}
+
+# Часовой пояс Алматы (UTC+5)
+ALMATY_TZ = timezone(timedelta(hours=5))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 📝 ЛОГИРОВАНИЕ
@@ -157,6 +167,9 @@ class Form(StatesGroup):
     expense_fund = State()
     expense_pocket = State()
     expense_comment = State()
+    expense_insufficient = State()     # Ожидание выбора: частично / одолжить / перенести
+    expense_borrow_fund = State()      # Выбор фонда для заимствования
+    expense_borrow_pocket = State()    # Выбор кармана для заимствования
     add_pocket_fund = State()
     add_pocket_items = State()
 
@@ -291,11 +304,6 @@ def parse_items(text):
             amt = re.sub(r'[^\d]', '', parts[1])
             if name and amt and amt.isdigit() and int(amt) > 0:
                 items.append({'name': name, 'amount': int(amt)})
-                log.info(f"   📝 «{name}» = {amt}")
-            else:
-                log.warning(f"   ⚠️ «{line}»")
-        else:
-            log.warning(f"   ⚠️ «{line}»")
     return items
 
 async def thinking(cid, text="⏳ Считаю..."):
@@ -375,6 +383,21 @@ def get_config(uw):
         log.error(f"❌ get_config: {e}"); return None
 
 
+def get_debts(uw):
+    """Читает историю и считает долги между фондами."""
+    try:
+        rows = uw['history'].get_all_values()
+        debts = {}  # "Фонд X → Фонд Y": сумма
+        for row in rows[1:]:
+            if len(row) >= 6 and row[1] == "ДОЛГ":
+                key = row[3]  # "🏗 Себестоимость → 💻 Операционные"
+                amt = abs(sf(row[2]))
+                debts[key] = debts.get(key, 0) + amt
+        return debts
+    except:
+        return {}
+
+
 def write_balance(uw, bal, cfg):
     try:
         tb=cfg.get('tb',0); s1=cfg.get('sum1',0); s2=cfg.get('sum2',0); s3=cfg.get('sum3',0)
@@ -433,9 +456,7 @@ def save_brief(uw, f1, f2, f3):
 
     cfg={'tb':tb,'sum1':s1,'sum2':s2,'sum3':s3,'margin':margin,'remainder':remainder,'pf1':pf1,'pf2':pf2,'pf3':pf3}
     write_balance(uw,[0,0,0,0],cfg)
-    log.info(f"✅ Бриф: ТБ={tb}")
     return cfg
-
 
 def add_pockets_to_fund(uw, fund_num, new_items):
     all_f={}
@@ -513,6 +534,25 @@ def kb_save():
     kb=types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add("➕ Добавить ещё","✅ Сохранить"); kb.add("🔙 Отмена"); return kb
 
+def kb_insufficient(available, shortage):
+    """Inline-клавиатура: 3 варианта при нехватке средств."""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            f"💳 Оплатить частично ({fmt(available)} ₸)",
+            callback_data="exp_partial"
+        ),
+        types.InlineKeyboardButton(
+            f"🔄 Одолжить у другого фонда ({fmt(shortage)} ₸)",
+            callback_data="exp_borrow"
+        ),
+        types.InlineKeyboardButton(
+            "⏳ Перенести платёж",
+            callback_data="exp_postpone"
+        ),
+    )
+    return kb
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🚀 /start
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -547,9 +587,6 @@ async def cmd_start(msg: types.Message, state: FSMContext):
             parse_mode="Markdown", reply_markup=kb_main()
         )
     else:
-        try: await bot.send_video_note(msg.chat.id, VIDEO_1_INTRO)
-        except: pass
-
         await msg.answer(
             "💎 *FUNDAMENTA*\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
@@ -583,10 +620,13 @@ async def start_brief(msg, state, fn):
     async with state.proxy() as d:
         d['bf'] = fn
         if fn == 1: d['f1']=[]; d['f2']=[]; d['f3']=[]
+
+    # Круг с подсказкой для текущего шага
     vid = FUND_VIDEOS.get(fn)
     if vid:
         try: await bot.send_video_note(msg.chat.id, vid)
         except: pass
+
     await msg.answer(FUND_BRIEF_MSG[fn], parse_mode="Markdown", reply_markup=kb_cancel())
     await Form.brief_items.set()
 
@@ -685,7 +725,28 @@ async def finish_brief(msg, state):
         await state.finish()
         return await msg.answer("❌ Ошибка: сумма = 0.\nНачни заново: /start")
 
+    # Круг 4 — завершающий
+    try: await bot.send_video_note(msg.chat.id, VIDEO_4_DOP)
+    except: pass
+
+    # Круг 5 — тестовая неделя (вместе с сообщением распределения)
+    try: await bot.send_video_note(msg.chat.id, VIDEO_5_FINAL)
+    except: pass
+
     tb=cfg['tb']; m=cfg['margin']; r=cfg['remainder']
+
+    # ─── ФИНАЛЬНЫЙ ТЕКСТ ПО ТЗ ───
+
+    text_1 = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎉 *Отлично!*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "*Фонды сформированы.*\n\n"
+        f"🎯 *Точка безубыточности:*\n"
+        f"    *{fmt(tb)} ₸/мес*\n\n"
+    )
+
+    # Показать карманы
     def pb(items, base):
         return "".join(
             f"    • {i['name']} — {fmt(i['amount'])} ₸ "
@@ -693,37 +754,100 @@ async def finish_brief(msg, state):
             for i in items
         )
 
-    text = (
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🎉 *ВСЁ ГОТОВО!*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 *Точка безубыточности:*\n"
-        f"    *{fmt(tb)} ₸/мес*\n\n"
-        "Это минимум, который нужно зарабатывать,\n"
-        "чтобы бизнес не уходил в минус.\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "*Как будет распределяться каждое поступление:*\n\n"
+    text_1 += (
         f"🏗 *Себестоимость — {cfg['pf1']}% от ТБ*\n"
-        f"    (= {fmt(cfg['sum1'])} ₸/мес)\n"
+        f"    ({fmt(cfg['sum1'])} ₸/мес)\n"
         f"{pb(f1, tb)}\n"
         f"💻 *Операционные — {cfg['pf2']}% от Маржи*\n"
-        f"    (= {fmt(cfg['sum2'])} ₸/мес, маржа = {fmt(m)} ₸)\n"
+        f"    ({fmt(cfg['sum2'])} ₸/мес, маржа = {fmt(m)} ₸)\n"
         f"{pb(f2, m)}\n"
         f"☕️ *Дополнительные — {cfg['pf3']}% от Остатка*\n"
-        f"    (= {fmt(cfg['sum3'])} ₸/мес, остаток = {fmt(r)} ₸)\n"
-        f"{pb(f3, r)}\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Теперь каждый доход автоматически\n"
-        "распределяется по фондам и карманам! 🚀\n\n"
-        "💡 *Не забывай каждый день вносить суммы*\n"
-        "*своих продаж* — любые денежные средства,\n"
-        "которые приходят на счёт твоего бизнеса!\n\n"
-        "🎬 *Посмотри полноценный урок по финансам:*"
+        f"    ({fmt(cfg['sum3'])} ₸/мес, остаток = {fmt(r)} ₸)\n"
+        f"{pb(f3, r)}"
     )
+    await msg.answer(text_1, parse_mode="Markdown")
+
+    # Объяснение системы
+    text_2 = (
+        "Теперь каждое поступление денег будет\n"
+        "автоматически распределяться по фондам\n"
+        "и карманам.\n\n"
+        "Ты больше не работаешь\n"
+        "*«из одного общего мешка»*.\n"
+        "Каждая сумма имеет своё назначение.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Теперь ты всегда видишь:\n\n"
+        "  💰 сколько денег *реально доступно*\n"
+        "  💸 сколько *можно потратить*\n"
+        "  🛡 какие расходы *защищены*\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "*Пример:*\n\n"
+        "Администратор просит аванс — 150 000 ₸.\n\n"
+        "Ты открываешь карман «ЗП администраторов»\n"
+        "и видишь — там 100 000 ₸.\n\n"
+        "Значит:\n"
+        "  ✅ ты можешь выплатить 100 000 ₸\n"
+        "  ⏳ оставшиеся 50 000 ₸ — после\n"
+        "     следующего поступления\n\n"
+        "Ты *не трогаешь:*\n"
+        "  🚫 фонд аренды\n"
+        "  🚫 фонд налогов\n"
+        "  🚫 фонд зарплат других сотрудников\n\n"
+        "Именно так система *защищает бизнес*\n"
+        "от кассовых разрывов.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Теперь ты управляешь деньгами,\n"
+        "а не реагируешь на давление расходов.\n\n"
+        "*Добро пожаловать в систему\n"
+        "финансового контроля.* 💎"
+    )
+    await msg.answer(text_2, parse_mode="Markdown")
+
+    # Активация
+    text_3 = (
+        "🔓 *АКТИВИРУЙ ПОЛНЫЙ ДОСТУП*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Активируй систему финансового контроля\n"
+        "всего за *6 999 ₸/мес* и получи\n"
+        "полный доступ к FUNDAMENTA!\n\n"
+        "*С полным доступом ты получишь:*\n\n"
+        "✅ Автоматическое распределение каждого\n"
+        "   поступления по фондам\n"
+        "✅ Защиту от кассовых разрывов\n"
+        "✅ Контроль расходов в реальном времени\n"
+        "✅ Запрет на «поедание» аренды, налогов\n"
+        "   и зарплат\n"
+        "✅ Прогноз наполнения фондов на 30 дней\n"
+        "✅ Отслеживание долгов фондов\n"
+        "   в переходный период\n"
+        "✅ Индекс финансовой устойчивости бизнеса\n\n"
+        "И самое главное — *сообщество*\n"
+        "*предпринимателей*, где раз в месяц\n"
+        "проводятся воркшопы! 🤝\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Ты всегда будешь видеть:\n\n"
+        "  💰 сколько можно тратить\n"
+        "  🛡 сколько уже защищено\n"
+        "  📅 когда закроются обязательства\n"
+        "  ⚠️ есть ли риск\n\n"
+        "*FUNDAMENTA — это не учёт.*\n"
+        "*Это система финансового контроля*\n"
+        "*и предсказуемости.* 💎"
+    )
+    # TODO: добавить реальную ссылку на оплату
+    # ilk = types.InlineKeyboardMarkup()
+    # ilk.add(types.InlineKeyboardButton("💎 Активировать за 6 999 ₸/мес", url="..."))
+    await msg.answer(text_3, parse_mode="Markdown")
+
     ilk = types.InlineKeyboardMarkup()
     ilk.add(types.InlineKeyboardButton("🎬 Смотреть урок по финансам", url=YOUTUBE_LESSON_URL))
+
     await state.finish()
-    await msg.answer(text, parse_mode="Markdown", reply_markup=ilk)
+    await msg.answer(
+        "🎬 А пока — посмотри полноценный урок\n"
+        "по финансам бизнеса:",
+        parse_mode="Markdown", reply_markup=ilk
+    )
     await msg.answer("Выбери действие 👇", reply_markup=kb_main())
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -756,11 +880,7 @@ async def income_process(msg: types.Message, state: FSMContext):
 
     clean=re.sub(r'[^\d]','',msg.text)
     if not clean or int(clean)<=0:
-        return await msg.answer(
-            "⚠️ Введи только цифры!\n"
-            "Например: `500000`",
-            parse_mode="Markdown"
-        )
+        return await msg.answer("⚠️ Введи только цифры!\nНапример: `500000`", parse_mode="Markdown")
 
     amount=int(clean)
     st=await thinking(msg.chat.id, "⏳ Распределяю по фондам и карманам...")
@@ -820,7 +940,7 @@ async def income_process(msg: types.Message, state: FSMContext):
     await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main())
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 💸 РАСХОД
+# 💸 РАСХОД (с 3 вариантами при нехватке)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dp.message_handler(lambda m: m.text == "💸 Списать расход")
@@ -831,7 +951,7 @@ async def expense_start(msg: types.Message):
     await msg.answer(
         "💸 *РАСХОДНАЯ ОПЕРАЦИЯ*\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "Укажите сумму расхода.\n\n"
+        "Укажите сумму расхода.\n"
         "Только цифры, например: `120000`",
         parse_mode="Markdown", reply_markup=kb_cancel()
     )
@@ -839,17 +959,15 @@ async def expense_start(msg: types.Message):
 
 
 @dp.message_handler(state=Form.expense_amount)
-async def expense_amt(msg: types.Message, state: FSMContext):
+async def expense_amt_h(msg: types.Message, state: FSMContext):
     if msg.text == "🔙 Отмена":
         await state.finish()
         return await msg.answer("❌ Действие отменено.", reply_markup=kb_main())
     clean=re.sub(r'[^\d]','',msg.text)
     if not clean or int(clean)<=0:
         return await msg.answer("⚠️ Введи только цифры!\nНапример: `120000`", parse_mode="Markdown")
-
     async with state.proxy() as d: d['exp_amt']=int(clean)
     uw=get_user_ws(msg.from_user.id); bal=get_balance(uw)
-
     await msg.answer(
         f"💸 *Сумма расхода:* {fmt(int(clean))} ₸\n\n"
         "*Остатки в фондах:*\n\n"
@@ -870,21 +988,14 @@ async def expense_fund_h(msg: types.Message, state: FSMContext):
     fn=parse_fund(msg.text)
     if not fn:
         return await msg.answer("⚠️ Выбери фонд из кнопок ниже 👇", reply_markup=kb_funds())
-
     await bot.send_chat_action(msg.chat.id, types.ChatActions.TYPING)
     uw=get_user_ws(msg.from_user.id); pockets=get_pockets(uw,fn)
     if not pockets:
         await state.finish()
-        return await msg.answer(
-            "⚠️ В этом фонде ещё нет карманов.\n"
-            "Заполни бриф: /start",
-            reply_markup=kb_main()
-        )
+        return await msg.answer("⚠️ В этом фонде нет карманов.\nЗаполни бриф: /start", reply_markup=kb_main())
     async with state.proxy() as d: d['exp_fn']=fn
-
     await msg.answer(
-        f"📂 *{FUND_NAMES[fn]}*\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"📂 *{FUND_NAMES[fn]}*\n━━━━━━━━━━━━━━━━━━\n\n"
         "Выберите из какого кармана Вы хотите\n"
         "провести расходную операцию?\n\n"
         "В скобках — текущий остаток в кармане.\n\n"
@@ -906,42 +1017,20 @@ async def expense_pocket_h(msg: types.Message, state: FSMContext):
             "Из какого фонда списываем? 👇",
             parse_mode="Markdown", reply_markup=kb_funds()
         )
-        await Form.expense_fund.set()
-        return
+        return await Form.expense_fund.set()
     if msg.text == "🔙 Отмена":
         await state.finish()
         return await msg.answer("❌ Действие отменено.", reply_markup=kb_main())
 
-    async with state.proxy() as d: fn=d['exp_fn']; amt=d['exp_amt']
+    async with state.proxy() as d: fn=d['exp_fn']
     uw=get_user_ws(msg.from_user.id); pockets=get_pockets(uw,fn)
     sel=None
     for p in pockets:
         if msg.text.startswith(p['name']): sel=p; break
     if not sel:
-        return await msg.answer(
-            "⚠️ Выбери карман из кнопок ниже 👇",
-            reply_markup=kb_pockets(pockets)
-        )
-
-    pb=int(sel['balance'])
-    if amt > pb:
-        nm = msg.from_user.first_name
-        await state.finish()
-        return await msg.answer(
-            f"⛔️ *{nm}*, в данном кармане не хватает\n"
-            f"денежных средств для Вашей расходной\n"
-            f"операции.\n\n"
-            f"*Карман:* {sel['name']}\n"
-            f"*В кармане:* {fmt(pb)} ₸\n"
-            f"*Нужно:* {fmt(amt)} ₸\n"
-            f"*Не хватает:* {fmt(amt - pb)} ₸\n\n"
-            "Пожалуйста, дождитесь пополнения кармана\n"
-            "и после совершите расходную операцию,\n"
-            "иначе есть риск попасть в *кассовый разрыв*.\n\n"
-            "Будьте аккуратны! ⚠️",
-            parse_mode="Markdown", reply_markup=kb_main()
-        )
+        return await msg.answer("⚠️ Выбери карман из кнопок ниже 👇", reply_markup=kb_pockets(pockets))
     async with state.proxy() as d: d['exp_pocket']=sel
+
     await msg.answer(
         "📝 Напиши коротко — *на что тратим?*\n\n"
         "Например: `Оплата аренды за март`\n"
@@ -952,36 +1041,125 @@ async def expense_pocket_h(msg: types.Message, state: FSMContext):
 
 
 @dp.message_handler(state=Form.expense_comment)
-async def expense_final(msg: types.Message, state: FSMContext):
+async def expense_comment_h(msg: types.Message, state: FSMContext):
+    """После комментария проверяем баланс."""
     if msg.text == "🔙 Отмена":
         await state.finish()
         return await msg.answer("❌ Действие отменено.", reply_markup=kb_main())
 
-    comment=msg.text
+    comment = msg.text
     async with state.proxy() as d:
-        pocket=d['exp_pocket']; fn=d['exp_fn']; amt=d['exp_amt']
+        d['exp_comment'] = comment
+        pocket = d['exp_pocket']; fn = d['exp_fn']; amt = d['exp_amt']
 
-    st=await thinking(msg.chat.id, "⏳ Списываю расход...")
-    uw=get_user_ws(msg.from_user.id)
-    nb=int(pocket['balance'])-amt
-    ws=get_fund_ws(uw,fn); ws.update_cell(pocket['row'],5,nb); ws.update_cell(pocket['row'],6,emo(nb,pocket['planned']))
-    bal=get_balance(uw); bal[fn-1]-=amt; bal[3]=bal[0]+bal[1]+bal[2]
-    cfg=get_config(uw)
-    if cfg: write_balance(uw,bal,cfg)
+    pb = int(pocket['balance'])
+
+    # ═══ ДОСТАТОЧНО СРЕДСТВ ═══
+    if amt <= pb:
+        st = await thinking(msg.chat.id, "⏳ Списываю расход...")
+        uw = get_user_ws(msg.from_user.id)
+        nb = pb - amt
+        ws = get_fund_ws(uw, fn)
+        ws.update_cell(pocket['row'], 5, nb)
+        ws.update_cell(pocket['row'], 6, emo(nb, pocket['planned']))
+        bal = get_balance(uw); bal[fn-1] -= amt; bal[3] = bal[0]+bal[1]+bal[2]
+        cfg = get_config(uw)
+        if cfg: write_balance(uw, bal, cfg)
+        uw['history'].append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M"), "РАСХОД", -amt,
+            FUND_NAMES[fn], pocket['name'], comment,
+            msg.from_user.username or str(msg.from_user.id)
+        ])
+        await del_msg(st)
+        await state.finish()
+        return await msg.answer(
+            "✅ *РАСХОД СПИСАН!*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"💸 *Сумма:* -{fmt(amt)} ₸\n"
+            f"📂 *Фонд:* {FUND_NAMES[fn]}\n"
+            f"👛 *Карман:* {pocket['name']}\n"
+            f"💬 *Цель:* {comment}\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "*Остатки в фондах:*\n\n"
+            f"🏗 Себестоимость: *{fmt(bal[0])} ₸*\n"
+            f"💻 Операционные: *{fmt(bal[1])} ₸*\n"
+            f"☕️ Дополнительные: *{fmt(bal[2])} ₸*\n\n"
+            f"💰 *Всего в кассе: {fmt(bal[3])} ₸*",
+            parse_mode="Markdown", reply_markup=kb_main()
+        )
+
+    # ═══ НЕ ХВАТАЕТ — 3 ВАРИАНТА ═══
+    shortage = amt - pb
+    await msg.answer(
+        f"⚠️ *{msg.from_user.first_name}, не хватает средств!*\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Карман:* {pocket['name']}\n"
+        f"*Нужно:* {fmt(amt)} ₸\n"
+        f"*В кармане:* {fmt(pb)} ₸\n"
+        f"*Не хватает:* {fmt(shortage)} ₸\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери что делать:",
+        parse_mode="Markdown",
+        reply_markup=kb_insufficient(pb, shortage)
+    )
+    await Form.expense_insufficient.set()
+
+
+# ── Текстовые сообщения в состоянии ожидания кнопок ──
+@dp.message_handler(state=Form.expense_insufficient)
+async def expense_insuf_text(msg: types.Message, state: FSMContext):
+    await msg.answer("👆 Пожалуйста, нажми одну из кнопок выше.")
+
+@dp.message_handler(state=Form.expense_borrow_fund)
+async def expense_borrow_fund_text(msg: types.Message, state: FSMContext):
+    await msg.answer("👆 Нажми кнопку с фондом, из которого хочешь одолжить.")
+
+@dp.message_handler(state=Form.expense_borrow_pocket)
+async def expense_borrow_pocket_text(msg: types.Message, state: FSMContext):
+    await msg.answer("👆 Нажми кнопку с карманом, из которого хочешь одолжить.")
+
+
+# ── CALLBACK: Оплатить частично ──
+@dp.callback_query_handler(lambda c: c.data == "exp_partial", state=Form.expense_insufficient)
+async def cb_partial(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    async with state.proxy() as d:
+        pocket = d['exp_pocket']; fn = d['exp_fn']
+        comment = d['exp_comment']
+    pb = int(pocket['balance'])
+    if pb <= 0:
+        await state.finish()
+        return await cb.message.answer("⚠️ В кармане 0 ₸, нечего списывать.", reply_markup=kb_main())
+
+    st = await thinking(cb.message.chat.id, "⏳ Списываю частично...")
+    uw = get_user_ws(cb.from_user.id)
+    ws = get_fund_ws(uw, fn)
+    ws.update_cell(pocket['row'], 5, 0)
+    ws.update_cell(pocket['row'], 6, "🔴")
+    bal = get_balance(uw); bal[fn-1] -= pb; bal[3] = bal[0]+bal[1]+bal[2]
+    cfg = get_config(uw)
+    if cfg: write_balance(uw, bal, cfg)
     uw['history'].append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M"),"РАСХОД",-amt,
-        FUND_NAMES[fn],pocket['name'],comment,msg.from_user.username or str(msg.from_user.id)
+        datetime.now().strftime("%Y-%m-%d %H:%M"), "РАСХОД (частично)", -pb,
+        FUND_NAMES[fn], pocket['name'], comment,
+        cb.from_user.username or str(cb.from_user.id)
     ])
     await del_msg(st)
-
     await state.finish()
-    await msg.answer(
-        "✅ *РАСХОД СПИСАН!*\n"
+
+    async with state.proxy() as d:
+        amt = d.get('exp_amt', 0)
+    remainder = amt - pb
+
+    await cb.message.answer(
+        "✅ *ЧАСТИЧНАЯ ОПЛАТА!*\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"💸 *Сумма:* -{fmt(amt)} ₸\n"
+        f"💸 *Списано:* {fmt(pb)} ₸ из {fmt(amt)} ₸\n"
         f"📂 *Фонд:* {FUND_NAMES[fn]}\n"
         f"👛 *Карман:* {pocket['name']}\n"
         f"💬 *Цель:* {comment}\n\n"
+        f"⏳ *Остаток к оплате:* {fmt(remainder)} ₸\n"
+        "   _(оплатишь после следующего поступления)_\n\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "*Остатки в фондах:*\n\n"
         f"🏗 Себестоимость: *{fmt(bal[0])} ₸*\n"
@@ -991,8 +1169,215 @@ async def expense_final(msg: types.Message, state: FSMContext):
         parse_mode="Markdown", reply_markup=kb_main()
     )
 
+
+# ── CALLBACK: Одолжить у другого фонда ──
+@dp.callback_query_handler(lambda c: c.data == "exp_borrow", state=Form.expense_insufficient)
+async def cb_borrow(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    async with state.proxy() as d:
+        fn = d['exp_fn']; amt = d['exp_amt']
+        pocket = d['exp_pocket']
+
+    shortage = amt - int(pocket['balance'])
+    uw = get_user_ws(cb.from_user.id)
+
+    # Показать другие фонды
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ofn in [1, 2, 3]:
+        if ofn == fn: continue
+        bal_fn = get_balance(uw)[ofn - 1]
+        kb.add(types.InlineKeyboardButton(
+            f"{FUND_NAMES[ofn]} [{fmt(bal_fn)} ₸]",
+            callback_data=f"borrow_f{ofn}"
+        ))
+    kb.add(types.InlineKeyboardButton("🔙 Отмена", callback_data="exp_postpone"))
+
+    await cb.message.answer(
+        f"🔄 *ОДОЛЖИТЬ У ДРУГОГО ФОНДА*\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"Нужно одолжить: *{fmt(shortage)} ₸*\n\n"
+        f"Из какого фонда возьмём деньги? 👇",
+        parse_mode="Markdown", reply_markup=kb
+    )
+    await Form.expense_borrow_fund.set()
+
+
+# ── CALLBACK: Выбор фонда для заимствования ──
+@dp.callback_query_handler(lambda c: c.data.startswith("borrow_f"), state=Form.expense_borrow_fund)
+async def cb_borrow_fund(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    borrow_fn = int(cb.data[-1])  # 1, 2 или 3
+    async with state.proxy() as d:
+        d['borrow_fn'] = borrow_fn
+
+    uw = get_user_ws(cb.from_user.id)
+    pockets = get_pockets(uw, borrow_fn)
+
+    if not pockets:
+        return await cb.message.answer(
+            "⚠️ В этом фонде нет карманов.\n"
+            "Выбери другой фонд.",
+            parse_mode="Markdown"
+        )
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for p in pockets:
+        pb = int(p['balance'])
+        if pb > 0:
+            kb.add(types.InlineKeyboardButton(
+                f"{p['name']} [{fmt(pb)} ₸]",
+                callback_data=f"borrow_p{p['row']}"
+            ))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="exp_borrow"))
+
+    await cb.message.answer(
+        f"📂 *{FUND_NAMES[borrow_fn]}*\n━━━━━━━━━━━━━━━━━━\n\n"
+        "Из какого кармана одолжить? 👇\n\n"
+        "_(показаны только карманы с деньгами)_",
+        parse_mode="Markdown", reply_markup=kb
+    )
+    await Form.expense_borrow_pocket.set()
+
+
+# ── CALLBACK: Выбор кармана для заимствования ──
+@dp.callback_query_handler(lambda c: c.data.startswith("borrow_p"), state=Form.expense_borrow_pocket)
+async def cb_borrow_pocket(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    borrow_row = int(cb.data.replace("borrow_p", ""))
+
+    async with state.proxy() as d:
+        borrow_fn = d['borrow_fn']
+        fn = d['exp_fn']; amt = d['exp_amt']
+        pocket = d['exp_pocket']; comment = d['exp_comment']
+
+    uw = get_user_ws(cb.from_user.id)
+    pockets = get_pockets(uw, borrow_fn)
+    borrow_pocket = None
+    for p in pockets:
+        if p['row'] == borrow_row: borrow_pocket = p; break
+
+    if not borrow_pocket:
+        return await cb.message.answer("⚠️ Карман не найден. Попробуй снова.")
+
+    pb_orig = int(pocket['balance'])
+    shortage = amt - pb_orig
+    bpb = int(borrow_pocket['balance'])
+
+    if bpb < shortage:
+        return await cb.message.answer(
+            f"⚠️ В кармане «{borrow_pocket['name']}» только\n"
+            f"{fmt(bpb)} ₸, а нужно {fmt(shortage)} ₸.\n\n"
+            "Выбери другой карман с бо́льшим остатком.",
+            parse_mode="Markdown"
+        )
+
+    # ═══ ВЫПОЛНЯЕМ ЗАИМСТВОВАНИЕ ═══
+    st = await thinking(cb.message.chat.id, "⏳ Выполняю заимствование...")
+
+    # 1. Обнуляем оригинальный карман
+    ws_orig = get_fund_ws(uw, fn)
+    ws_orig.update_cell(pocket['row'], 5, 0)
+    ws_orig.update_cell(pocket['row'], 6, "🔴")
+
+    # 2. Списываем нехватку из кармана-донора
+    new_borrow_bal = bpb - shortage
+    ws_borrow = get_fund_ws(uw, borrow_fn)
+    ws_borrow.update_cell(borrow_pocket['row'], 5, new_borrow_bal)
+    ws_borrow.update_cell(borrow_pocket['row'], 6, emo(new_borrow_bal, borrow_pocket['planned']))
+
+    # 3. Обновляем баланс
+    bal = get_balance(uw)
+    bal[fn - 1] -= pb_orig
+    bal[borrow_fn - 1] -= shortage
+    bal[3] = bal[0] + bal[1] + bal[2]
+    cfg = get_config(uw)
+    if cfg: write_balance(uw, bal, cfg)
+
+    # 4. Записываем в историю
+    user_str = cb.from_user.username or str(cb.from_user.id)
+    uw['history'].append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M"), "РАСХОД", -amt,
+        FUND_NAMES[fn], pocket['name'], comment, user_str
+    ])
+    uw['history'].append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M"), "ДОЛГ", shortage,
+        f"{FUND_NAMES[fn]} ← {FUND_NAMES[borrow_fn]}",
+        f"{pocket['name']} ← {borrow_pocket['name']}",
+        f"Заимствование: {comment}", user_str
+    ])
+
+    await del_msg(st)
+    await state.finish()
+
+    await cb.message.answer(
+        "✅ *РАСХОД СПИСАН С ЗАИМСТВОВАНИЕМ!*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💸 *Сумма расхода:* {fmt(amt)} ₸\n"
+        f"💬 *Цель:* {comment}\n\n"
+        f"📂 Из кармана *«{pocket['name']}»*:\n"
+        f"   Списано {fmt(pb_orig)} ₸ (весь остаток)\n\n"
+        f"🔄 Одолжено у *«{borrow_pocket['name']}»*\n"
+        f"   ({FUND_NAMES[borrow_fn]}):\n"
+        f"   *{fmt(shortage)} ₸*\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💳 *ДОЛГ:* {FUND_NAMES[fn]} должен\n"
+        f"   {FUND_NAMES[borrow_fn]} → *{fmt(shortage)} ₸*\n\n"
+        "⚠️ Этот долг зафиксирован в истории.\n"
+        "При следующих поступлениях постарайся\n"
+        "покрыть его как можно скорее!\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "*Остатки в фондах:*\n\n"
+        f"🏗 Себестоимость: *{fmt(bal[0])} ₸*\n"
+        f"💻 Операционные: *{fmt(bal[1])} ₸*\n"
+        f"☕️ Дополнительные: *{fmt(bal[2])} ₸*\n\n"
+        f"💰 *Всего в кассе: {fmt(bal[3])} ₸*",
+        parse_mode="Markdown", reply_markup=kb_main()
+    )
+
+
+# ── CALLBACK: Перенести платёж ──
+@dp.callback_query_handler(lambda c: c.data == "exp_postpone", state=[Form.expense_insufficient, Form.expense_borrow_fund, Form.expense_borrow_pocket])
+async def cb_postpone(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.finish()
+    await cb.message.answer(
+        "⏳ *Платёж перенесён.*\n\n"
+        "Ты правильно делаешь — лучше подождать\n"
+        "следующего поступления, чем залезать\n"
+        "в другие фонды без необходимости.\n\n"
+        "Это и есть финансовый контроль! 💎",
+        parse_mode="Markdown", reply_markup=kb_main()
+    )
+
+# ── CALLBACK: назад к выбору фонда ──
+@dp.callback_query_handler(lambda c: c.data == "exp_borrow", state=Form.expense_borrow_pocket)
+async def cb_borrow_back(cb: types.CallbackQuery, state: FSMContext):
+    """Возврат к выбору фонда для заимствования."""
+    await cb.answer()
+    async with state.proxy() as d:
+        fn = d['exp_fn']; pocket = d['exp_pocket']; amt = d['exp_amt']
+    shortage = amt - int(pocket['balance'])
+    uw = get_user_ws(cb.from_user.id)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ofn in [1, 2, 3]:
+        if ofn == fn: continue
+        bal_fn = get_balance(uw)[ofn - 1]
+        kb.add(types.InlineKeyboardButton(
+            f"{FUND_NAMES[ofn]} [{fmt(bal_fn)} ₸]",
+            callback_data=f"borrow_f{ofn}"
+        ))
+    kb.add(types.InlineKeyboardButton("🔙 Отмена", callback_data="exp_postpone"))
+
+    await cb.message.answer(
+        f"🔄 *Из какого фонда одолжить?*\n\n"
+        f"Нужно: *{fmt(shortage)} ₸*",
+        parse_mode="Markdown", reply_markup=kb
+    )
+    await Form.expense_borrow_fund.set()
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 📊 БАЛАНС
+# 📊 БАЛАНС (с долгами)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dp.message_handler(lambda m: m.text == "📊 Баланс")
@@ -1028,8 +1413,19 @@ async def show_balance_h(msg: types.Message):
     text += (
         f"\n{h} *Запас хода:* {runway} мес.\n"
         f"   _(сколько проживёт бизнес\n"
-        f"   без новых поступлений)_\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        f"   без новых поступлений)_\n"
+    )
+
+    # Показать долги если есть
+    debts = get_debts(uw)
+    if debts:
+        text += "\n━━━━━━━━━━━━━━━━━━\n\n💳 *ДОЛГИ МЕЖДУ ФОНДАМИ:*\n\n"
+        for key, amt_d in debts.items():
+            text += f"  🔄 {key}: *{fmt(amt_d)} ₸*\n"
+        text += "\n⚠️ Постарайся покрыть долги\nпри следующих поступлениях!"
+
+    text += (
+        "\n\n━━━━━━━━━━━━━━━━━━\n"
         "💡 Нажми «📋 Подробно по фондам»\n"
         "чтобы увидеть все карманы."
     )
@@ -1051,38 +1447,28 @@ async def show_detail(msg: types.Message):
         fsum=int(cfg.get(f'sum{fn}',0)); fbal=bal[fn-1]; gap=max(0,fsum-fbal)
         pockets=get_pockets(uw,fn)
         text = (
-            f"{FUND_NAMES[fn]}\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{FUND_NAMES[fn]}\n━━━━━━━━━━━━━━━━━━\n\n"
             f"💰 *В фонде:* {fmt(fbal)} ₸\n"
             f"📋 *План на месяц:* {fmt(fsum)} ₸\n"
         )
         if gap > 0:
             text += f"📉 *Не хватает:* {fmt(gap)} ₸\n"
         text += f"   {bar(fbal, fsum)}\n\n"
-
         if pockets:
             text += "*Карманы (статьи расходов):*\n\n"
             for p in pockets:
-                pb=int(p['balance']); pp=int(p['planned']); pg=max(0,pp-pb)
-                st = emo(pb,pp)
-                text += f"  {st} *{p['name']}*\n"
-                text += f"     {fmt(pb)} ₸ из {fmt(pp)} ₸"
-                if pg > 0:
-                    text += f" _(не хватает {fmt(pg)} ₸)_"
-                text += f"\n     {bar(pb, pp)}\n\n"
+                pb_=int(p['balance']); pp_=int(p['planned']); pg_=max(0,pp_-pb_)
+                text += f"  {emo(pb_,pp_)} *{p['name']}*\n"
+                text += f"     {fmt(pb_)} ₸ из {fmt(pp_)} ₸"
+                if pg_ > 0: text += f" _(не хватает {fmt(pg_)} ₸)_"
+                text += f"\n     {bar(pb_, pp_)}\n\n"
         else:
             text += "  Нет карманов\n\n"
-
         await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main())
 
     total=bal[3]; gap=max(0,tb-total)
-    text = (
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *ИТОГО ВО ВСЕХ ФОНДАХ:* {fmt(total)} ₸\n"
-        f"🎯 *Точка безубыточности:* {fmt(tb)} ₸/мес\n"
-    )
-    if gap > 0:
-        text += f"\n📉 *До безубыточности не хватает:* {fmt(gap)} ₸"
+    text = f"━━━━━━━━━━━━━━━━━━\n💰 *ИТОГО ВО ВСЕХ ФОНДАХ:* {fmt(total)} ₸\n🎯 *Точка безубыточности:* {fmt(tb)} ₸/мес\n"
+    if gap > 0: text += f"\n📉 *До безубыточности не хватает:* {fmt(gap)} ₸"
     await msg.answer(text, parse_mode="Markdown", reply_markup=kb_main())
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1091,12 +1477,7 @@ async def show_detail(msg: types.Message):
 
 @dp.message_handler(lambda m: m.text == "⚙️ Настройки")
 async def settings(msg: types.Message):
-    await msg.answer(
-        "⚙️ *НАСТРОЙКИ*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Выбери действие 👇",
-        parse_mode="Markdown", reply_markup=kb_settings()
-    )
+    await msg.answer("⚙️ *НАСТРОЙКИ*\n━━━━━━━━━━━━━━━━━━\n\nВыбери действие 👇", parse_mode="Markdown", reply_markup=kb_settings())
 
 @dp.message_handler(lambda m: m.text == "📋 Текущие настройки")
 async def show_cfg(msg: types.Message):
@@ -1104,33 +1485,21 @@ async def show_cfg(msg: types.Message):
     uw=get_user_ws(msg.from_user.id); cfg=get_config(uw) if uw else None
     if not cfg:
         return await msg.answer("⚠️ Настройки не найдены.\nЗаполни бриф: /start", reply_markup=kb_settings())
-
-    m=cfg.get('margin',cfg['tb']-cfg.get('sum1',0))
-    r=cfg.get('remainder',m-cfg.get('sum2',0))
-
+    m_=cfg.get('margin',cfg['tb']-cfg.get('sum1',0)); r_=cfg.get('remainder',m_-cfg.get('sum2',0))
     text = (
-        "📋 *ТЕКУЩИЕ НАСТРОЙКИ*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 *Точка безубыточности:*\n"
-        f"   {fmt(cfg['tb'])} ₸/мес\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "*Распределение доходов:*\n\n"
-        f"🏗 *Себестоимость:* {cfg.get('pf1',0)}% от ТБ\n"
-        f"   План: {fmt(cfg.get('sum1',0))} ₸/мес\n\n"
-        f"💻 *Операционные:* {cfg.get('pf2',0)}% от маржи\n"
-        f"   План: {fmt(cfg.get('sum2',0))} ₸/мес\n"
-        f"   Маржа = {fmt(m)} ₸\n\n"
-        f"☕️ *Дополнительные:* {cfg.get('pf3',0)}% от остатка\n"
-        f"   План: {fmt(cfg.get('sum3',0))} ₸/мес\n"
-        f"   Остаток = {fmt(r)} ₸\n\n"
+        "📋 *ТЕКУЩИЕ НАСТРОЙКИ*\n━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 *Точка безубыточности:*\n   {fmt(cfg['tb'])} ₸/мес\n\n"
+        "━━━━━━━━━━━━━━━━━━\n\n*Распределение доходов:*\n\n"
+        f"🏗 *Себестоимость:* {cfg.get('pf1',0)}% от ТБ\n   План: {fmt(cfg.get('sum1',0))} ₸/мес\n\n"
+        f"💻 *Операционные:* {cfg.get('pf2',0)}% от маржи\n   План: {fmt(cfg.get('sum2',0))} ₸/мес\n   Маржа = {fmt(m_)} ₸\n\n"
+        f"☕️ *Дополнительные:* {cfg.get('pf3',0)}% от остатка\n   План: {fmt(cfg.get('sum3',0))} ₸/мес\n   Остаток = {fmt(r_)} ₸\n\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
     for fn in [1,2,3]:
         pockets=get_pockets(uw,fn)
         if pockets:
             text += f"*Карманы {FUND_NAMES[fn]}:*\n"
-            for p in pockets:
-                text += f"  • {p['name']} — {fmt(p['planned'])} ₸ ({round(p['pct'],1)}%)\n"
+            for p in pockets: text += f"  • {p['name']} — {fmt(p['planned'])} ₸ ({round(p['pct'],1)}%)\n"
             text += "\n"
     text += "💡 Чтобы изменить — нажми «Заполнить заново»"
     await msg.answer(text, parse_mode="Markdown", reply_markup=kb_settings())
@@ -1145,20 +1514,13 @@ async def add_pocket_start(msg: types.Message):
     uw=get_user_ws(msg.from_user.id); cfg=get_config(uw) if uw else None
     if not cfg:
         return await msg.answer("⚠️ Сначала заполни бриф: /start", reply_markup=kb_settings())
-
-    text = (
-        "➕ *ДОБАВИТЬ КАРМАН В ФОНД*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Сейчас в твоих фондах:\n\n"
-    )
+    text = "➕ *ДОБАВИТЬ КАРМАН В ФОНД*\n━━━━━━━━━━━━━━━━━━\n\nСейчас в твоих фондах:\n\n"
     for fn in [1,2,3]:
         pockets=get_pockets(uw,fn)
         text += f"*{FUND_NAMES[fn]}:*\n"
         if pockets:
-            for p in pockets:
-                text += f"  • {p['name']} — {fmt(p['planned'])} ₸\n"
-        else:
-            text += "  (пусто)\n"
+            for p in pockets: text += f"  • {p['name']} — {fmt(p['planned'])} ₸\n"
+        else: text += "  (пусто)\n"
         text += "\n"
     text += "В какой фонд добавить новый карман? 👇"
     await msg.answer(text, parse_mode="Markdown", reply_markup=kb_funds())
@@ -1173,25 +1535,17 @@ async def add_pocket_fund_h(msg: types.Message, state: FSMContext):
     fn=parse_fund(msg.text)
     if not fn:
         return await msg.answer("⚠️ Выбери фонд из кнопок ниже 👇", reply_markup=kb_funds())
-
     async with state.proxy() as d: d['add_fn']=fn; d['add_items']=[]
-
     uw=get_user_ws(msg.from_user.id); pockets=get_pockets(uw,fn)
     existing = ""
     if pockets:
         existing = "*Уже есть:*\n"
-        for p in pockets:
-            existing += f"  • {p['name']} — {fmt(p['planned'])} ₸\n"
+        for p in pockets: existing += f"  • {p['name']} — {fmt(p['planned'])} ₸\n"
         existing += "\n"
-
     await msg.answer(
-        f"📂 *{FUND_NAMES[fn]}*\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"{existing}"
-        "✏️ Напиши новые карманы:\n"
-        "`Название - сумма`\n\n"
-        "Каждый — с новой строки.\n"
-        "Старые карманы останутся на месте!",
+        f"📂 *{FUND_NAMES[fn]}*\n━━━━━━━━━━━━━━━━━━\n\n{existing}"
+        "✏️ Напиши новые карманы:\n`Название - сумма`\n\n"
+        "Каждый — с новой строки.\nСтарые карманы останутся на месте!",
         parse_mode="Markdown", reply_markup=kb_cancel()
     )
     await Form.add_pocket_items.set()
@@ -1202,63 +1556,40 @@ async def add_pocket_items_h(msg: types.Message, state: FSMContext):
     if msg.text == "🔙 Отмена":
         await state.finish()
         return await msg.answer("❌ Действие отменено.", reply_markup=kb_settings())
-
     if msg.text == "✅ Сохранить":
         async with state.proxy() as d: fn=d['add_fn']; items=d.get('add_items',[])
         if not items:
-            return await msg.answer(
-                "⚠️ Ты ещё ничего не добавил!\n"
-                "Напиши карманы в формате: `Название - сумма`",
-                parse_mode="Markdown", reply_markup=kb_cancel()
-            )
+            return await msg.answer("⚠️ Ты ещё ничего не добавил!\nНапиши: `Название - сумма`", parse_mode="Markdown")
         st=await thinking(msg.chat.id, "⏳ Пересчитываю проценты и сохраняю...")
         uw=get_user_ws(msg.from_user.id); cfg=add_pockets_to_fund(uw,fn,items)
         await del_msg(st)
         if not cfg:
             await state.finish()
             return await msg.answer("❌ Ошибка сохранения.\nПопробуй /start", reply_markup=kb_main())
-        txt=""
-        for it in items:
-            txt += f"  • {it['name']} — {fmt(it['amount'])} ₸\n"
+        txt="".join(f"  • {it['name']} — {fmt(it['amount'])} ₸\n" for it in items)
         await state.finish()
         return await msg.answer(
-            "✅ *КАРМАНЫ ДОБАВЛЕНЫ!*\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"📂 *{FUND_NAMES[fn]}*\n\n"
-            f"Новые карманы:\n{txt}\n"
+            f"✅ *КАРМАНЫ ДОБАВЛЕНЫ!*\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"📂 *{FUND_NAMES[fn]}*\n\nНовые карманы:\n{txt}\n"
             f"🎯 *Новая точка безубыточности:* {fmt(cfg['tb'])} ₸/мес\n\n"
-            "Все проценты пересчитаны.\n"
-            "Балансы существующих карманов сохранены! 👍",
+            "Все проценты пересчитаны.\nБалансы существующих карманов сохранены! 👍",
             parse_mode="Markdown", reply_markup=kb_main()
         )
-
     if msg.text == "➕ Добавить ещё":
-        return await msg.answer(
-            "✏️ Напиши ещё карманы:\n"
-            "`Название - сумма`\n\n"
-            "Каждый — с новой строки.",
-            parse_mode="Markdown", reply_markup=kb_cancel()
-        )
-
+        return await msg.answer("✏️ Напиши ещё карманы:\n`Название - сумма`", parse_mode="Markdown", reply_markup=kb_cancel())
     new=parse_items(msg.text)
     if not new:
         return await msg.answer(
-            "⚠️ Не удалось распознать.\n\n"
-            "Формат: `Название - сумма`\n\n"
-            "*Пример:*\n"
-            "`Новый сотрудник - 250000`\n"
-            "`Доп. реклама - 100000`",
+            "⚠️ Не удалось распознать.\n\nФормат: `Название - сумма`\n\n"
+            "*Пример:*\n`Новый сотрудник - 250000`\n`Доп. реклама - 100000`",
             parse_mode="Markdown", reply_markup=kb_cancel()
         )
     async with state.proxy() as d:
         fn=d['add_fn']; lst=d.get('add_items',[]); lst.extend(new); d['add_items']=lst
-    txt=""
-    for i,it in enumerate(lst,1):
-        txt += f"  {i}. {it['name']} — {fmt(it['amount'])} ₸\n"
+    txt="".join(f"  {i}. {it['name']} — {fmt(it['amount'])} ₸\n" for i,it in enumerate(lst,1))
     n=len(new); w="карман" if n==1 else ("кармана" if n<5 else "карманов")
     await msg.answer(
-        f"✅ Добавлено: {n} {w}!\n\n"
-        f"Новые карманы для *{FUND_NAMES[fn]}:*\n\n{txt}\n"
+        f"✅ Добавлено: {n} {w}!\n\nНовые карманы для *{FUND_NAMES[fn]}:*\n\n{txt}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "➕ *Добавить ещё* — если есть ещё карманы\n"
         "✅ *Сохранить* — пересчитать проценты и сохранить",
@@ -1271,27 +1602,21 @@ async def add_pocket_items_h(msg: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda m: m.text == "🔄 Заполнить заново")
 async def reset(msg: types.Message, state: FSMContext):
-    log.info(f"🔄 Сброс: {msg.from_user.id}")
     uw=get_user_ws(msg.from_user.id); cfg=get_config(uw) if uw else None
     tb_str=fmt(cfg['tb']) if cfg else "Не задано"
     await msg.answer(
-        "⚠️ *ВНИМАНИЕ!*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ *ВНИМАНИЕ!*\n━━━━━━━━━━━━━━━━━━\n\n"
         f"Текущая ТБ: *{tb_str} ₸*\n\n"
-        "*Что произойдёт:*\n"
-        "🔄 Все статьи будут записаны заново\n"
-        "🔄 Балансы обнулятся\n"
-        "🔄 Новые поступления пойдут по новым %\n\n"
+        "*Что произойдёт:*\n🔄 Все статьи будут записаны заново\n"
+        "🔄 Балансы обнулятся\n🔄 Новые поступления пойдут по новым %\n\n"
         "Начинаем заполнение заново...",
         parse_mode="Markdown"
     )
     await start_brief(msg, state, 1)
 
-
 @dp.message_handler(lambda m: m.text == "🔙 Главное меню")
 async def back(msg: types.Message):
     await msg.answer("Главное меню 👇", reply_markup=kb_main())
-
 
 @dp.message_handler(lambda m: m.text == "🔗 Таблица")
 async def sheet_link(msg: types.Message):
@@ -1302,10 +1627,8 @@ async def sheet_link(msg: types.Message):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("📂 Открыть мою Google Таблицу", url=url))
     await msg.answer(
-        "📊 *ТВОЯ ПЕРСОНАЛЬНАЯ ТАБЛИЦА*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "У тебя *своя личная* таблица!\n"
-        "Все данные хранятся в Google Sheets.\n"
+        "📊 *ТВОЯ ПЕРСОНАЛЬНАЯ ТАБЛИЦА*\n━━━━━━━━━━━━━━━━━━\n\n"
+        "У тебя *своя личная* таблица!\nВсе данные хранятся в Google Sheets.\n"
         "Каждый фонд — на отдельном листе.\n\n"
         "*Листы в таблице:*\n\n"
         "  ⚙️ Настройки — ТБ, маржа, проценты\n"
@@ -1327,15 +1650,105 @@ async def cancel(msg: types.Message, state: FSMContext):
     if await state.get_state(): await state.finish()
     await msg.answer("❌ Действие отменено.", reply_markup=kb_main())
 
-
 @dp.message_handler()
 async def unknown(msg: types.Message):
     await msg.answer(
-        "🤔 Не понял команду.\n\n"
-        "Используй кнопки меню 👇\n"
-        "Или напиши /start чтобы начать.",
+        "🤔 Не понял команду.\n\nИспользуй кнопки меню 👇\nИли напиши /start чтобы начать.",
         reply_markup=kb_main()
     )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔔 ЕЖЕДНЕВНЫЕ УВЕДОМЛЕНИЯ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def send_morning_ritual():
+    """Утренний ритуал + программирование."""
+    log.info("🌅 Отправляю утренний ритуал...")
+    try:
+        rows = ws_users.get_all_values()
+    except:
+        return
+    for row in rows[1:]:
+        if len(row) < 4 or not row[0]: continue
+        uid = int(row[0]); name = row[2] or "Друг"
+        try:
+            await bot.send_message(uid,
+                f"🌅 *Доброе утро, {name}!*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Удели 10 секунд.\n"
+                "Закрой глаза и скажи себе:\n\n"
+                "💭 _«Этот бизнес я делаю, чтобы\n"
+                "делать свою жизнь и жизнь\n"
+                "своих близких лучше и ярче.\n\n"
+                "Всё в моих руках.\n"
+                "У меня всё получится!\n"
+                "Аминь!»_\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "💪 Сегодня будет отличный день!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            log.warning(f"   ⚠️ Не удалось отправить {uid}: {e}")
+        await asyncio.sleep(0.1)
+
+
+async def send_evening_reminder():
+    """Вечернее напоминание о внесении поступлений."""
+    log.info("🌙 Отправляю вечернее напоминание...")
+    try:
+        rows = ws_users.get_all_values()
+    except:
+        return
+    for row in rows[1:]:
+        if len(row) < 4 or not row[0]: continue
+        uid = int(row[0]); name = row[2] or "Друг"
+        try:
+            await bot.send_message(uid,
+                f"🌙 *{name}, день подходит к концу!*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Не забудь внести поступления\n"
+                "за сегодня! 💰\n\n"
+                "Каждое внесение — это шаг\n"
+                "к наполнению твоих фондов\n"
+                "и финансовой устойчивости бизнеса.\n\n"
+                "Нажми *«💰 Внести доход»* 👇",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            log.warning(f"   ⚠️ Не удалось отправить {uid}: {e}")
+        await asyncio.sleep(0.1)
+
+
+async def notification_scheduler():
+    """Фоновая задача: проверяет время и отправляет уведомления."""
+    last_morning = None
+    last_evening = None
+    log.info("🔔 Планировщик уведомлений запущен!")
+
+    while True:
+        try:
+            now = datetime.now(ALMATY_TZ)
+            today = now.date()
+
+            # Утренний ритуал в 9:00
+            if now.hour == 9 and last_morning != today:
+                last_morning = today
+                await send_morning_ritual()
+
+            # Вечернее напоминание в 21:00
+            if now.hour == 21 and last_evening != today:
+                last_evening = today
+                await send_evening_reminder()
+        except Exception as e:
+            log.error(f"🔔 Ошибка планировщика: {e}")
+
+        await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+
+
+async def on_startup(dp_instance):
+    """Запускается при старте бота."""
+    asyncio.create_task(notification_scheduler())
+    log.info("🔔 Уведомления активированы: 9:00 и 21:00 (Алматы)")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🚀 ЗАПУСК
@@ -1343,7 +1756,7 @@ async def unknown(msg: types.Message):
 
 if __name__ == '__main__':
     log.info("━━━━━━━━━━━━━━━━━━")
-    log.info("💎 FUNDAMENTA BOT")
+    log.info("💎 FUNDAMENTA BOT v3")
     log.info("🚀 Запуск...")
     log.info("━━━━━━━━━━━━━━━━━━")
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
