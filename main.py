@@ -3,6 +3,9 @@ import sys
 import re
 import asyncio
 import sqlite3
+import hmac
+import hashlib
+import json
 import gspread
 from datetime import datetime, timezone, timedelta
 from aiogram import Bot, Dispatcher, types
@@ -10,6 +13,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
+from aiohttp import web
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 💎 FUNDAMENTA BOT v4 — КОНФИГУРАЦИЯ
@@ -21,6 +25,13 @@ CREDENTIALS_FILE = 'sheetsapi-443912-7487420df9cd.json'
 YOUTUBE_LESSON_URL = "https://youtu.be/lDp0aICRlR0?si=vtO0xtpxA3uLBADf"
 DB_FILE = 'fundamenta.db'
 SYNC_INTERVAL = 300  # секунды
+
+# ━━━ TRIBUTE ПОДПИСКА ━━━
+TRIBUTE_API_KEY = ''           # API ключ из дашборда Tribute (Dashboard → Settings → API Keys)
+TRIBUTE_PAYMENT_URL = ''       # Ссылка на подписку Tribute для этого бота
+WEBHOOK_HOST = '0.0.0.0'
+WEBHOOK_PORT = 8080
+ADMIN_USER_ID = 870933779              # Telegram user_id администратора (для команды /activate)
 
 # file_id видео-кружков (привязаны к боту 7780440391). Если круги не шлются — отправь круг боту, скопируй file_id из ответа.
 VIDEO_1_INTRO = "DQACAgIAAxkBAAICCmmUgJ-9aD1_vuMco8tXcv9AC0RpAAJ4jQACTpWoSF_997AbFDQaOgQ"
@@ -49,6 +60,7 @@ def db_init():
         CREATE TABLE IF NOT EXISTS config (user_id INTEGER PRIMARY KEY, tb REAL DEFAULT 0, sum1 REAL DEFAULT 0, sum2 REAL DEFAULT 0, sum3 REAL DEFAULT 0, margin REAL DEFAULT 0, remainder REAL DEFAULT 0, pf1 REAL DEFAULT 0, pf2 REAL DEFAULT 0, pf3 REAL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS pockets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, fund_num INTEGER, name TEXT, planned REAL DEFAULT 0, pct REAL DEFAULT 0, balance REAL DEFAULT 0, position INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, date TEXT, type TEXT, amount REAL, fund TEXT DEFAULT '', pocket TEXT DEFAULT '', comment TEXT DEFAULT '', username TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, status TEXT DEFAULT 'inactive', tribute_sub_id TEXT DEFAULT '', started_at TEXT DEFAULT '', expires_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_pockets_user ON pockets(user_id, fund_num);
         CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
     """)
@@ -129,6 +141,39 @@ def db_get_debts(uid):
 
 def db_get_history(uid):
     c = db_connect(); rows = c.execute("SELECT * FROM history WHERE user_id=? ORDER BY id", (uid,)).fetchall(); c.close()
+    return [dict(r) for r in rows]
+
+# ━━━ ПОДПИСКИ ━━━
+def db_get_sub(uid):
+    c = db_connect(); r = c.execute("SELECT * FROM subscriptions WHERE user_id=?", (uid,)).fetchone(); c.close()
+    return dict(r) if r else None
+
+def db_has_active_sub(uid):
+    c = db_connect()
+    r = c.execute("SELECT 1 FROM subscriptions WHERE user_id=? AND status='active'", (uid,)).fetchone()
+    c.close()
+    return r is not None
+
+def db_set_sub(uid, status, tribute_sub_id=''):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    c = db_connect()
+    existing = c.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (uid,)).fetchone()
+    if existing:
+        if status == 'active':
+            c.execute("UPDATE subscriptions SET status=?, tribute_sub_id=?, updated_at=? WHERE user_id=?",
+                (status, tribute_sub_id or '', now, uid))
+        else:
+            c.execute("UPDATE subscriptions SET status=?, updated_at=? WHERE user_id=?",
+                (status, now, uid))
+    else:
+        c.execute("INSERT INTO subscriptions (user_id, status, tribute_sub_id, started_at, updated_at) VALUES (?,?,?,?,?)",
+            (uid, status, tribute_sub_id or '', now, now))
+    c.commit(); c.close()
+
+def db_get_active_subscribers():
+    c = db_connect()
+    rows = c.execute("SELECT s.user_id, u.first_name FROM subscriptions s LEFT JOIN users u ON s.user_id=u.user_id WHERE s.status='active'").fetchall()
+    c.close()
     return [dict(r) for r in rows]
 
 # ━━━ GOOGLE SHEETS SYNC ━━━
@@ -429,6 +474,115 @@ def kb_insufficient(av, sh):
            types.InlineKeyboardButton(f"🔄 Одолжить у другого фонда ({fmt(sh)} ₸)",callback_data="exp_borrow"),
            types.InlineKeyboardButton("⏳ Перенести платёж",callback_data="exp_postpone")); return kb
 
+# ━━━ TRIBUTE WEBHOOK SERVER ━━━
+def verify_tribute_signature(body: bytes, signature: str) -> bool:
+    if not TRIBUTE_API_KEY:
+        return False
+    expected = hmac.new(TRIBUTE_API_KEY.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+async def tribute_webhook_handler(request: web.Request) -> web.Response:
+    body = await request.read()
+    signature = request.headers.get('trbt-signature', '')
+    if TRIBUTE_API_KEY and not verify_tribute_signature(body, signature):
+        log.warning("⚠️ Tribute webhook: неверная подпись")
+        return web.Response(status=403, text="Invalid signature")
+    try:
+        data = json.loads(body)
+    except Exception:
+        return web.Response(status=400, text="Bad JSON")
+    event = data.get('event', '')
+    payload = data.get('payload', {})
+    user_data = payload.get('user', {})
+    tg_id = user_data.get('telegram_id') or payload.get('telegram_id')
+    sub_id = str(payload.get('id', ''))
+    if not tg_id:
+        log.warning(f"⚠️ Tribute webhook без telegram_id: {event}")
+        return web.Response(status=200, text="OK (no tg_id)")
+    tg_id = int(tg_id)
+    log.info(f"💳 Tribute event: {event} | user={tg_id} | sub_id={sub_id}")
+    if event in ('newSubscription', 'renewedSubscription'):
+        db_set_sub(tg_id, 'active', sub_id)
+        try:
+            await bot.send_message(tg_id,
+                "✅ *ПОДПИСКА АКТИВИРОВАНА!*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Теперь тебе доступны все функции\n"
+                "FUNDAMENTA! 💎\n\n"
+                "  💰 Внесение доходов\n"
+                "  💸 Списание расходов\n"
+                "  📊 Баланс и аналитика\n"
+                "  ⚙️ Настройки фондов\n\n"
+                "Выбери действие 👇",
+                parse_mode="Markdown", reply_markup=kb_main())
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось отправить подтверждение подписки {tg_id}: {e}")
+    elif event == 'cancelledSubscription':
+        db_set_sub(tg_id, 'inactive', sub_id)
+        try:
+            await bot.send_message(tg_id,
+                "⚠️ *Подписка отменена*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Доступ к функциям FUNDAMENTA\n"
+                "приостановлен.\n\n"
+                "Чтобы продолжить — оформи подписку\n"
+                "заново: /subscribe",
+                parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось отправить уведомление об отмене {tg_id}: {e}")
+    return web.Response(status=200, text="OK")
+
+async def start_webhook_server():
+    app = web.Application()
+    app.router.add_post('/webhook/tribute', tribute_webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
+    await site.start()
+    log.info(f"🌐 Tribute webhook server: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/webhook/tribute")
+
+# ━━━ ПРОВЕРКА ПОДПИСКИ ━━━
+def kb_subscribe():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if TRIBUTE_PAYMENT_URL:
+        kb.add(types.InlineKeyboardButton("💳 Оформить подписку", url=TRIBUTE_PAYMENT_URL))
+    kb.add(types.InlineKeyboardButton("🔄 Я уже оплатил", callback_data="check_sub"))
+    return kb
+
+async def require_sub(msg: types.Message) -> bool:
+    if db_has_active_sub(msg.from_user.id):
+        return True
+    await msg.answer(
+        "🔒 *НУЖНА ПОДПИСКА*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Эта функция доступна только\n"
+        "по подписке *FUNDAMENTA*.\n\n"
+        "Стоимость: *6 999 ₸/мес*\n"
+        "Автопродление каждый месяц.\n\n"
+        "Оформи подписку и получи\n"
+        "полный доступ ко всем функциям! 💎\n\n"
+        "Нажми /subscribe для подробностей.",
+        parse_mode="Markdown", reply_markup=kb_subscribe())
+    return False
+
+@dp.callback_query_handler(lambda c: c.data == "check_sub", state="*")
+async def cb_check_sub(cb: types.CallbackQuery):
+    await cb.answer()
+    if db_has_active_sub(cb.from_user.id):
+        await cb.message.answer(
+            "✅ *Подписка активна!*\n\n"
+            "Все функции доступны.\n"
+            "Выбери действие 👇",
+            parse_mode="Markdown", reply_markup=kb_main())
+    else:
+        await cb.message.answer(
+            "⏳ Оплата ещё не поступила.\n\n"
+            "Если ты только что оплатил — подожди\n"
+            "1–2 минуты и нажми «Я уже оплатил» снова.\n\n"
+            "Если проблема сохраняется — напиши\n"
+            "администратору.",
+            parse_mode="Markdown", reply_markup=kb_subscribe())
+
 # ━━━ /start ━━━
 @dp.message_handler(commands=['start'], state="*")
 async def cmd_start(msg: types.Message, state: FSMContext):
@@ -441,6 +595,82 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     else:
         await msg.answer("💎 *FUNDAMENTA*\n━━━━━━━━━━━━━━━━━━\n\n"+f"Привет, *{msg.from_user.first_name}*! 👋\n\n"+"Это Fundamenta — помощник, который поможет\nтебе наладить порядок в твоём бизнесе.\n\n"+"Следуй инструкциям и обязательно\nсмотри видео-подсказки! 🎬\n\n"+"Мы пройдём *3 простых шага*:\n\n"+"1️⃣ Запишем расходы на *себестоимость*\n    _(без чего продукт не может существовать)_\n"+"2️⃣ Запишем *операционные* расходы\n    _(+ твоя зарплата как собственника)_\n"+"3️⃣ Запишем *дополнительные* расходы\n    _(что делает бизнес лучше)_\n\n"+"После этого система рассчитает\nточку безубыточности и начнёт\nавтоматически распределять доходы! 🚀\n\n"+"━━━━━━━━━━━━━━━━━━\n"+"Готов? Начинаем!",parse_mode="Markdown")
         await start_brief(msg, state, 1)
+
+# ━━━ /subscribe ━━━
+@dp.message_handler(commands=['subscribe'], state="*")
+async def cmd_subscribe(msg: types.Message, state: FSMContext):
+    uid = msg.from_user.id
+    sub = db_get_sub(uid)
+    if sub and sub['status'] == 'active':
+        await msg.answer(
+            "✅ *ПОДПИСКА АКТИВНА*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"Статус: *Активна* ✅\n"
+            f"С: {sub.get('started_at','—')}\n\n"
+            "Все функции FUNDAMENTA доступны.\n"
+            "Выбери действие 👇",
+            parse_mode="Markdown", reply_markup=kb_main())
+    else:
+        await msg.answer(
+            "💎 *ПОДПИСКА FUNDAMENTA*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Стоимость: *6 999 ₸/мес*\n"
+            "Автопродление каждый месяц.\n\n"
+            "*Что входит в подписку:*\n\n"
+            "✅ Автоматическое распределение\n"
+            "   доходов по фондам\n"
+            "✅ Защита от кассовых разрывов\n"
+            "✅ Контроль расходов в реальном времени\n"
+            "✅ Запрет на «поедание» аренды,\n"
+            "   налогов и зарплат\n"
+            "✅ Прогноз наполнения фондов\n"
+            "✅ Отслеживание долгов фондов\n"
+            "✅ Индекс финансовой устойчивости\n"
+            "✅ Сообщество предпринимателей\n"
+            "   и ежемесячные воркшопы\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Оформи подписку 👇",
+            parse_mode="Markdown", reply_markup=kb_subscribe())
+
+# ━━━ /activate (admin) ━━━
+@dp.message_handler(commands=['activate'], state="*")
+async def cmd_activate(msg: types.Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_USER_ID:
+        return await msg.answer("⛔ Команда доступна только администратору.")
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return await msg.answer("Использование: `/activate USER_ID`", parse_mode="Markdown")
+    try:
+        target_uid = int(parts[1])
+    except ValueError:
+        return await msg.answer("⚠️ USER_ID должен быть числом.")
+    db_set_sub(target_uid, 'active', 'manual')
+    await msg.answer(f"✅ Подписка активирована для user_id: `{target_uid}`", parse_mode="Markdown")
+    try:
+        await bot.send_message(target_uid,
+            "✅ *ПОДПИСКА АКТИВИРОВАНА!*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Администратор активировал тебе\n"
+            "полный доступ к FUNDAMENTA! 💎\n\n"
+            "Выбери действие 👇",
+            parse_mode="Markdown", reply_markup=kb_main())
+    except Exception:
+        pass
+
+# ━━━ /deactivate (admin) ━━━
+@dp.message_handler(commands=['deactivate'], state="*")
+async def cmd_deactivate(msg: types.Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_USER_ID:
+        return await msg.answer("⛔ Команда доступна только администратору.")
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return await msg.answer("Использование: `/deactivate USER_ID`", parse_mode="Markdown")
+    try:
+        target_uid = int(parts[1])
+    except ValueError:
+        return await msg.answer("⚠️ USER_ID должен быть числом.")
+    db_set_sub(target_uid, 'inactive')
+    await msg.answer(f"❌ Подписка деактивирована для user_id: `{target_uid}`", parse_mode="Markdown")
 
 # ━━━ БРИФ ━━━
 async def start_brief(msg, state, fn):
@@ -552,7 +782,7 @@ async def finish_brief(msg, state):
         "*FUNDAMENTA — это не учёт.*\n"
         "*Это система финансового контроля*\n"
         "*и предсказуемости.* 💎")
-    await msg.answer(t3,parse_mode="Markdown")
+    await msg.answer(t3, parse_mode="Markdown", reply_markup=kb_subscribe())
     ilk=types.InlineKeyboardMarkup(); ilk.add(types.InlineKeyboardButton("🎬 Смотреть урок по финансам",url=YOUTUBE_LESSON_URL))
     await state.finish()
     await msg.answer("🎬 А пока — посмотри полноценный урок\nпо финансам бизнеса:",parse_mode="Markdown",reply_markup=ilk)
@@ -563,6 +793,7 @@ async def finish_brief(msg, state):
 # ━━━ ДОХОД ━━━
 @dp.message_handler(lambda m: m.text=="💰 Внести доход")
 async def income_start(msg: types.Message):
+    if not await require_sub(msg): return
     if not db_get_config(msg.from_user.id): return await msg.answer("⚠️ Сначала заполни бриф: /start",reply_markup=kb_main())
     await msg.answer("💰 *НОВЫЙ ДОХОД*\n━━━━━━━━━━━━━━━━━━\n\nВведи сумму, которая пришла\nна счёт твоего бизнеса.\n\nЭто любые денежные средства:\nоплата клиента, перевод, наличные.\n\nТолько цифры, например: `500000`",parse_mode="Markdown",reply_markup=kb_cancel()); await Form.income_amount.set()
 
@@ -595,6 +826,7 @@ async def income_process(msg: types.Message, state: FSMContext):
 # ━━━ РАСХОД ━━━
 @dp.message_handler(lambda m: m.text=="💸 Списать расход")
 async def expense_start(msg: types.Message):
+    if not await require_sub(msg): return
     if not db_get_config(msg.from_user.id): return await msg.answer("⚠️ Сначала заполни бриф: /start",reply_markup=kb_main())
     await msg.answer("💸 *РАСХОДНАЯ ОПЕРАЦИЯ*\n━━━━━━━━━━━━━━━━━━\n\nУкажите сумму расхода.\nТолько цифры, например: `120000`",parse_mode="Markdown",reply_markup=kb_cancel()); await Form.expense_amount.set()
 
@@ -723,6 +955,7 @@ async def cb_postpone(cb: types.CallbackQuery, state: FSMContext):
 # ━━━ БАЛАНС ━━━
 @dp.message_handler(lambda m: m.text=="📊 Баланс")
 async def show_bal(msg: types.Message):
+    if not await require_sub(msg): return
     uid=msg.from_user.id; cfg=db_get_config(uid)
     if not cfg: return await msg.answer("⚠️ Сначала заполни бриф: /start",reply_markup=kb_main())
     st=await thinking(msg.chat.id,"⏳ Загружаю баланс...")
@@ -747,6 +980,7 @@ async def show_bal(msg: types.Message):
 # ━━━ ПОДРОБНО ━━━
 @dp.message_handler(lambda m: m.text=="📋 Подробно по фондам")
 async def show_detail(msg: types.Message):
+    if not await require_sub(msg): return
     uid=msg.from_user.id; cfg=db_get_config(uid)
     if not cfg: return await msg.answer("⚠️ Сначала заполни бриф: /start",reply_markup=kb_main())
     st=await thinking(msg.chat.id,"⏳ Загружаю данные по фондам...")
@@ -776,10 +1010,12 @@ async def show_detail(msg: types.Message):
 # ━━━ НАСТРОЙКИ ━━━
 @dp.message_handler(lambda m: m.text=="⚙️ Настройки")
 async def settings(msg: types.Message):
+    if not await require_sub(msg): return
     await msg.answer("⚙️ *НАСТРОЙКИ*\n━━━━━━━━━━━━━━━━━━\n\nВыбери действие 👇",parse_mode="Markdown",reply_markup=kb_settings())
 
 @dp.message_handler(lambda m: m.text=="📋 Текущие настройки")
 async def show_cfg(msg: types.Message):
+    if not await require_sub(msg): return
     uid=msg.from_user.id; cfg=db_get_config(uid)
     if not cfg: return await msg.answer("⚠️ Настройки не найдены.\nЗаполни бриф: /start",reply_markup=kb_settings())
     st=await thinking(msg.chat.id,"⏳ Загружаю настройки...")
@@ -803,6 +1039,7 @@ async def show_cfg(msg: types.Message):
 # ━━━ ДОБАВИТЬ КАРМАН ━━━
 @dp.message_handler(lambda m: m.text=="➕ Добавить карман в фонд")
 async def add_pocket_start(msg: types.Message):
+    if not await require_sub(msg): return
     uid=msg.from_user.id; cfg=db_get_config(uid)
     if not cfg: return await msg.answer("⚠️ Сначала заполни бриф: /start",reply_markup=kb_settings())
     st=await thinking(msg.chat.id,"⏳ Загружаю список фондов...")
@@ -853,6 +1090,7 @@ async def add_pocket_items_h(msg: types.Message, state: FSMContext):
 # ━━━ ПРОЧЕЕ ━━━
 @dp.message_handler(lambda m: m.text=="🔄 Заполнить заново")
 async def reset(msg: types.Message, state: FSMContext):
+    if not await require_sub(msg): return
     cfg=db_get_config(msg.from_user.id); tb_s=fmt(cfg['tb']) if cfg else "Не задано"
     await msg.answer("⚠️ *ВНИМАНИЕ!*\n━━━━━━━━━━━━━━━━━━\n\n"+f"Текущая ТБ: *{tb_s} ₸*\n\n"+"*Что произойдёт:*\n🔄 Все статьи будут записаны заново\n🔄 Балансы обнулятся\n🔄 Новые поступления пойдут по новым %\n\nНачинаем заполнение заново...",parse_mode="Markdown")
     await start_brief(msg, state, 1)
@@ -863,6 +1101,7 @@ async def back(msg: types.Message):
 
 @dp.message_handler(lambda m: m.text=="🔗 Таблица")
 async def sheet_link(msg: types.Message):
+    if not await require_sub(msg): return
     u=db_get_user(msg.from_user.id)
     if not u or not u.get('sheet_id'): return await msg.answer("⚠️ Сначала заполни бриф: /start")
     url=f"https://docs.google.com/spreadsheets/d/{u['sheet_id']}"
@@ -891,7 +1130,7 @@ async def unknown(msg: types.Message):
 
 # ━━━ УВЕДОМЛЕНИЯ ━━━
 async def send_morning():
-    for u in db_get_all_users():
+    for u in db_get_active_subscribers():
         if not u['user_id']: continue
         name = u['first_name'] or 'Друг'
         try: await bot.send_message(u['user_id'],f"🌅 *Доброе утро, {name}!*\n━━━━━━━━━━━━━━━━━━\n\nУдели 10 секунд.\nЗакрой глаза и скажи себе:\n\n💭 _«Этот бизнес я делаю, чтобы\nделать свою жизнь и жизнь\nсвоих близких лучше и ярче.\n\nВсё в моих руках.\nУ меня всё получится!\nАминь!»_\n\n━━━━━━━━━━━━━━━━━━\n💪 Сегодня будет отличный день!",parse_mode="Markdown")
@@ -899,7 +1138,7 @@ async def send_morning():
         await asyncio.sleep(0.1)
 
 async def send_evening():
-    for u in db_get_all_users():
+    for u in db_get_active_subscribers():
         if not u['user_id']: continue
         name = u['first_name'] or 'Друг'
         try: await bot.send_message(u['user_id'],f"🌙 *{name}, день подходит к концу!*\n━━━━━━━━━━━━━━━━━━\n\nНе забудь внести поступления\nза сегодня! 💰\n\nКаждое внесение — это шаг\nк наполнению твоих фондов\nи финансовой устойчивости бизнеса.\n\nНажми *«💰 Внести доход»* 👇",parse_mode="Markdown")
@@ -918,6 +1157,10 @@ async def notif_scheduler():
 
 async def on_startup(dp_instance):
     asyncio.create_task(sync_loop()); asyncio.create_task(notif_scheduler())
+    if TRIBUTE_API_KEY:
+        asyncio.create_task(start_webhook_server())
+    else:
+        log.warning("⚠️ TRIBUTE_API_KEY не задан — webhook-сервер не запущен")
     log.info("🔄 Sync + 🔔 Notifications active")
 
 if __name__ == '__main__':
