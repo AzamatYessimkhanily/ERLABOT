@@ -639,13 +639,13 @@ async def cmd_activate(msg: types.Message, state: FSMContext):
         return await msg.answer("⛔ Команда доступна только администратору.")
     parts = msg.text.split()
     if len(parts) < 2:
-        return await msg.answer("Использование: `/activate USER_ID`", parse_mode="Markdown")
+        return await msg.answer("Использование: /activate USER_ID")
     try:
         target_uid = int(parts[1])
     except ValueError:
         return await msg.answer("⚠️ USER_ID должен быть числом.")
     db_set_sub(target_uid, 'active', 'manual')
-    await msg.answer(f"✅ Подписка активирована для user_id: {target_uid}")
+    await msg.answer(f"✅ Подписка активирована для id {target_uid}")
     try:
         await bot.send_message(target_uid,
             "✅ *ПОДПИСКА АКТИВИРОВАНА!*\n"
@@ -664,13 +664,13 @@ async def cmd_deactivate(msg: types.Message, state: FSMContext):
         return await msg.answer("⛔ Команда доступна только администратору.")
     parts = msg.text.split()
     if len(parts) < 2:
-        return await msg.answer("Использование: `/deactivate USER_ID`", parse_mode="Markdown")
+        return await msg.answer("Использование: /deactivate USER_ID")
     try:
         target_uid = int(parts[1])
     except ValueError:
         return await msg.answer("⚠️ USER_ID должен быть числом.")
     db_set_sub(target_uid, 'inactive')
-    await msg.answer(f"❌ Подписка деактивирована для user_id: {target_uid}")
+    await msg.answer(f"❌ Подписка деактивирована для id {target_uid}")
 
 # ━━━ БРИФ ━━━
 async def start_brief(msg, state, fn):
