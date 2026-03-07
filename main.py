@@ -645,7 +645,7 @@ async def cmd_activate(msg: types.Message, state: FSMContext):
     except ValueError:
         return await msg.answer("⚠️ USER_ID должен быть числом.")
     db_set_sub(target_uid, 'active', 'manual')
-    await msg.answer(f"✅ Подписка активирована для user_id: `{target_uid}`", parse_mode="Markdown")
+    await msg.answer(f"✅ Подписка активирована для user_id: {target_uid}")
     try:
         await bot.send_message(target_uid,
             "✅ *ПОДПИСКА АКТИВИРОВАНА!*\n"
@@ -670,7 +670,7 @@ async def cmd_deactivate(msg: types.Message, state: FSMContext):
     except ValueError:
         return await msg.answer("⚠️ USER_ID должен быть числом.")
     db_set_sub(target_uid, 'inactive')
-    await msg.answer(f"❌ Подписка деактивирована для user_id: `{target_uid}`", parse_mode="Markdown")
+    await msg.answer(f"❌ Подписка деактивирована для user_id: {target_uid}")
 
 # ━━━ БРИФ ━━━
 async def start_brief(msg, state, fn):
