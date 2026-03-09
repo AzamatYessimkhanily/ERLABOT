@@ -492,17 +492,22 @@ async def tribute_webhook_handler(request: web.Request) -> web.Response:
         data = json.loads(body)
     except Exception:
         return web.Response(status=400, text="Bad JSON")
-    event = data.get('event', '')
-    payload = data.get('payload', {})
-    user_data = payload.get('user', {})
-    tg_id = user_data.get('telegram_id') or payload.get('telegram_id')
-    sub_id = str(payload.get('id', ''))
+    # Tribute шлёт поле name (new_subscription / renewed_subscription / cancelled_subscription)
+    # и кладёт Telegram ID пользователя в payload.telegram_user_id
+    event = data.get('name', '')
+    payload = data.get('payload', {}) or {}
+    tg_id = payload.get('telegram_user_id')
+    sub_id = str(payload.get('subscription_id', payload.get('id', '')))
     if not tg_id:
-        log.warning(f"⚠️ Tribute webhook без telegram_id: {event}")
+        log.warning(f"⚠️ Tribute webhook без telegram_user_id: {event}")
         return web.Response(status=200, text="OK (no tg_id)")
-    tg_id = int(tg_id)
+    try:
+        tg_id = int(tg_id)
+    except Exception:
+        log.warning(f"⚠️ Tribute webhook: некорректный telegram_user_id={tg_id!r} для события {event}")
+        return web.Response(status=200, text="OK (bad tg_id)")
     log.info(f"💳 Tribute event: {event} | user={tg_id} | sub_id={sub_id}")
-    if event in ('newSubscription', 'renewedSubscription'):
+    if event in ('new_subscription', 'renewed_subscription'):
         db_set_sub(tg_id, 'active', sub_id)
         try:
             await bot.send_message(tg_id,
@@ -518,7 +523,7 @@ async def tribute_webhook_handler(request: web.Request) -> web.Response:
                 parse_mode="Markdown", reply_markup=kb_main())
         except Exception as e:
             log.warning(f"⚠️ Не удалось отправить подтверждение подписки {tg_id}: {e}")
-    elif event == 'cancelledSubscription':
+    elif event == 'cancelled_subscription':
         db_set_sub(tg_id, 'inactive', sub_id)
         try:
             await bot.send_message(tg_id,
