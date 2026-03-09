@@ -483,6 +483,7 @@ def verify_tribute_signature(body: bytes, signature: str) -> bool:
 
 async def tribute_webhook_handler(request: web.Request) -> web.Response:
     body = await request.read()
+    log.info(f"TRIBUTE RAW WEBHOOK: {body.decode('utf-8', 'ignore')}")
     signature = request.headers.get('trbt-signature', '')
     if TRIBUTE_API_KEY and not verify_tribute_signature(body, signature):
         log.warning("⚠️ Tribute webhook: неверная подпись")
