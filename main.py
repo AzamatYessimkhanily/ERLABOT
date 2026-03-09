@@ -27,8 +27,8 @@ DB_FILE = 'fundamenta.db'
 SYNC_INTERVAL = 300  # секунды
 
 # ━━━ TRIBUTE ПОДПИСКА ━━━
-TRIBUTE_API_KEY = ''           # API ключ из дашборда Tribute (Dashboard → Settings → API Keys)
-TRIBUTE_PAYMENT_URL = ''       # Ссылка на подписку Tribute для этого бота
+TRIBUTE_API_KEY = '2dd4676f-7f47-4919-8232-acb051b1'           # API ключ из дашборда Tribute (Dashboard → Settings → API Keys)
+TRIBUTE_PAYMENT_URL = 'https://t.me/tribute/app?startapp=sQ3T'       # Ссылка на подписку Tribute для этого бота
 WEBHOOK_HOST = '0.0.0.0'
 WEBHOOK_PORT = 8080
 ADMIN_USER_ID = 870933779              # Telegram user_id администратора (для команды /activate)
