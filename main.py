@@ -172,7 +172,10 @@ def db_set_sub(uid, status, tribute_sub_id=''):
 
 def db_get_active_subscribers():
     c = db_connect()
-    rows = c.execute("SELECT s.user_id, u.first_name FROM subscriptions s LEFT JOIN users u ON s.user_id=u.user_id WHERE s.status='active'").fetchall()
+    # ━━━ ВРЕМЕННО: УВЕДОМЛЕНИЯ ВСЕМ ПОЛЬЗОВАТЕЛЯМ ━━━
+    rows = c.execute("SELECT u.user_id, u.first_name FROM users u").fetchall()
+    # ━━━ ОРИГИНАЛЬНАЯ ЛОГИКА (только активные подписчики, раскомментировать для возврата) ━━━
+    # rows = c.execute("SELECT s.user_id, u.first_name FROM subscriptions s LEFT JOIN users u ON s.user_id=u.user_id WHERE s.status='active'").fetchall()
     c.close()
     return [dict(r) for r in rows]
 
@@ -556,20 +559,23 @@ def kb_subscribe():
     return kb
 
 async def require_sub(msg: types.Message) -> bool:
-    if db_has_active_sub(msg.from_user.id):
-        return True
-    await msg.answer(
-        "🔒 *НУЖНА ПОДПИСКА*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Эта функция доступна только\n"
-        "по подписке *FUNDAMENTA*.\n\n"
-        "Стоимость: *6 999 ₸/мес*\n"
-        "Автопродление каждый месяц.\n\n"
-        "Оформи подписку и получи\n"
-        "полный доступ ко всем функциям! 💎\n\n"
-        "Нажми /subscribe для подробностей.",
-        parse_mode="Markdown", reply_markup=kb_subscribe())
-    return False
+    # ━━━ ВРЕМЕННО: БЕСПЛАТНЫЙ ДОСТУП ДЛЯ ВСЕХ ━━━
+    return True
+    # ━━━ ОРИГИНАЛЬНАЯ ЛОГИКА ПОДПИСКИ (раскомментировать для возврата) ━━━
+    # if db_has_active_sub(msg.from_user.id):
+    #     return True
+    # await msg.answer(
+    #     "🔒 *НУЖНА ПОДПИСКА*\n"
+    #     "━━━━━━━━━━━━━━━━━━\n\n"
+    #     "Эта функция доступна только\n"
+    #     "по подписке *FUNDAMENTA*.\n\n"
+    #     "Стоимость: *6 999 ₸/мес*\n"
+    #     "Автопродление каждый месяц.\n\n"
+    #     "Оформи подписку и получи\n"
+    #     "полный доступ ко всем функциям! 💎\n\n"
+    #     "Нажми /subscribe для подробностей.",
+    #     parse_mode="Markdown", reply_markup=kb_subscribe())
+    # return False
 
 @dp.callback_query_handler(lambda c: c.data == "check_sub", state="*")
 async def cb_check_sub(cb: types.CallbackQuery):
